@@ -6,7 +6,7 @@ ESP32 Automatic watering
 - MOS 12v
 - Water pump 12v
 - Power adapter 12v
-## Phone Control
+## Mobile Control
 <p align="center">
 <img src="https://github.com/MustangYM/Automatic-Watering/blob/main/phone.jpg" width="250px"/>
 </p>
