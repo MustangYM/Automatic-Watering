@@ -71,7 +71,6 @@ Typical connection:
 
 ## Notes
 
-- The phone and computer must be connected to the **same local network** as the ESP32
 - Do **not** connect the pump directly to the ESP32
 - The pump should be driven through the MOS module
 - If you use a different voltage pump, update the hardware accordingly
