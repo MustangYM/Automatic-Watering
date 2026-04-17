@@ -11,7 +11,7 @@ ESP32 Automatic watering
 <img src="https://github.com/MustangYM/Automatic-Watering/blob/main/phone.jpg" width="250px"/>
 </p>
 
-## Conputer Control
+## Computer Control
 <p align="center">
 <img src="https://github.com/MustangYM/Automatic-Watering/blob/main/mac.png" width="750px"/>
 </p>
