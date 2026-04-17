@@ -2,8 +2,8 @@
 #include <WebServer.h>
 
 //配置你的wifi网络和密码
-const char* WIFI_SSID = "MustangYMPublic";
-const char* WIFI_PASS = "19921218";
+const char* WIFI_SSID = "";
+const char* WIFI_PASS = "";
 
 const int BUTTON_PIN = 0;
 // 2先用板载 LED 模拟水泵
