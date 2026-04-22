@@ -1,13 +1,20 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <time.h>
 
-//配置你的wifi网络和密码
+// ==============================
+// 配置你的 Wi-Fi
+// ==============================
 const char* WIFI_SSID = "";
 const char* WIFI_PASS = "";
 
+// 北京时间 NTP
+const char* TZ_INFO = "CST-8";
+const char* NTP_SERVER_1 = "ntp1.aliyun.com";
+const char* NTP_SERVER_2 = "ntp.ntsc.ac.cn";
+const char* NTP_SERVER_3 = "pool.ntp.org";
+
 const int BUTTON_PIN = 0;
-// 2先用板载 LED 模拟水泵
-// 23就是直接接mos板
 const int PUMP_PIN = 23;
 
 WebServer server(80);
@@ -23,15 +30,41 @@ unsigned long totalWaterMs = 0;
 unsigned int waterCount = 0;
 
 // ------------------------------
-// 模拟土壤湿度相关
-// 说明：
-// 1. 这不是真实传感器数据
-// 2. 不浇水时，湿度会缓慢下降
-// 3. 浇水时，湿度会缓慢上升
+// 模拟土壤湿度
 // ------------------------------
-float simulatedSoilMoisture = 56.0f;       // 0 ~ 100
+float simulatedSoilMoisture = 56.0f;
 unsigned long lastSoilUpdateAt = 0;
 
+// ------------------------------
+// 定时浇水配置
+// intervalDays = 1 表示每天
+// intervalDays = 2 表示每隔 2 天
+// anchorEpochDay = 保存时的“基准日”
+// lastRunEpochDay = 上次执行的日期，防止同一天重复触发
+// ------------------------------
+struct ScheduleConfig {
+  bool enabled;
+  int hour;
+  int minute;
+  int intervalDays;
+  int durationSec;
+  long anchorEpochDay;
+  long lastRunEpochDay;
+};
+
+ScheduleConfig gSchedule = {
+  false,   // enabled
+  9,       // hour
+  0,       // minute
+  1,       // intervalDays
+  5,       // durationSec
+  -1,      // anchorEpochDay
+  -1       // lastRunEpochDay
+};
+
+// ==============================
+// 工具函数
+// ==============================
 void applyPumpState() {
   digitalWrite(PUMP_PIN, pumpState ? HIGH : LOW);
 }
@@ -77,6 +110,80 @@ String currentTotalWaterText() {
   return formatDuration(currentTotal);
 }
 
+// ==============================
+// 时间相关
+// ==============================
+bool getBeijingTime(struct tm* timeinfo) {
+  return getLocalTime(timeinfo, 100);
+}
+
+bool isTimeSynced() {
+  struct tm timeinfo;
+  return getBeijingTime(&timeinfo);
+}
+
+String currentBeijingTimeText() {
+  struct tm timeinfo;
+  if (!getBeijingTime(&timeinfo)) {
+    return "未同步";
+  }
+
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+long currentEpochDay() {
+  struct tm timeinfo;
+  if (!getBeijingTime(&timeinfo)) {
+    return -1;
+  }
+
+  time_t t = mktime(&timeinfo);
+  return (long)(t / 86400);
+}
+
+String scheduleModeText() {
+  if (!gSchedule.enabled) {
+    return "未启用";
+  }
+
+  if (gSchedule.intervalDays <= 1) {
+    return "每天";
+  }
+
+  return "每隔 " + String(gSchedule.intervalDays) + " 天";
+}
+
+String scheduleSummaryText() {
+  if (!gSchedule.enabled) {
+    return "当前未启用自动浇水";
+  }
+
+  char hm[16];
+  snprintf(hm, sizeof(hm), "%02d:%02d", gSchedule.hour, gSchedule.minute);
+
+  String text = scheduleModeText();
+  text += " ";
+  text += String(hm);
+  text += " 浇水 ";
+  text += String(gSchedule.durationSec);
+  text += " 秒";
+
+  return text;
+}
+
+String scheduleLastRunText() {
+  if (gSchedule.lastRunEpochDay < 0) {
+    return "暂无";
+  }
+
+  return "第 " + String(gSchedule.lastRunEpochDay) + " 天已执行";
+}
+
+// ==============================
+// 湿度模拟
+// ==============================
 void updateSimulatedSoilMoisture() {
   unsigned long now = millis();
 
@@ -90,14 +197,11 @@ void updateSimulatedSoilMoisture() {
     return;
   }
 
-  // 每秒更新一次
   lastSoilUpdateAt = now;
 
   if (pumpState) {
-    // 正在“浇水”时，湿度上升更快
     simulatedSoilMoisture += 1.3f;
   } else {
-    // 不浇水时，湿度缓慢下降
     simulatedSoilMoisture -= 0.18f;
   }
 
@@ -119,6 +223,9 @@ String soilLevelText(int moisture) {
   return "很干";
 }
 
+// ==============================
+// 浇水控制
+// ==============================
 void stopWatering(const String& reason) {
   if (pumpState) {
     unsigned long now = millis();
@@ -165,6 +272,48 @@ void startWatering(unsigned long durationMs, const String& reason) {
   Serial.println(durationMs);
 }
 
+// ==============================
+// 定时任务检查
+// ==============================
+void checkScheduleTask() {
+  if (!gSchedule.enabled) return;
+  if (!isTimeSynced()) return;
+
+  struct tm timeinfo;
+  if (!getBeijingTime(&timeinfo)) return;
+
+  long epochDay = currentEpochDay();
+  if (epochDay < 0) return;
+
+  if (gSchedule.anchorEpochDay < 0) {
+    gSchedule.anchorEpochDay = epochDay;
+  }
+
+  if (timeinfo.tm_hour != gSchedule.hour) return;
+  if (timeinfo.tm_min != gSchedule.minute) return;
+
+  if (epochDay == gSchedule.lastRunEpochDay) {
+    return;
+  }
+
+  long dayDelta = epochDay - gSchedule.anchorEpochDay;
+  if (dayDelta < 0) return;
+
+  int intervalDays = gSchedule.intervalDays <= 0 ? 1 : gSchedule.intervalDays;
+
+  if ((dayDelta % intervalDays) != 0) {
+    return;
+  }
+
+  gSchedule.lastRunEpochDay = epochDay;
+  startWatering((unsigned long)gSchedule.durationSec * 1000UL, "schedule task");
+
+  Serial.println("Schedule triggered!");
+}
+
+// ==============================
+// JSON 状态
+// ==============================
 String jsonStatus() {
   int soil = currentSoilMoisturePercent();
 
@@ -187,22 +336,56 @@ String jsonStatus() {
   json += "\"ip\":\"";
   json += WiFi.localIP().toString();
   json += "\",";
+  json += "\"ssid\":\"";
+  json += WiFi.SSID();
+  json += "\",";
+  json += "\"beijingTime\":\"";
+  json += currentBeijingTimeText();
+  json += "\",";
+  json += "\"timeSynced\":";
+  json += (isTimeSynced() ? "true" : "false");
+  json += ",";
   json += "\"soil\":";
   json += String(soil);
   json += ",";
   json += "\"soilText\":\"";
   json += soilLevelText(soil);
   json += "\",";
-  json += "\"soilSimulated\":true";
+  json += "\"soilSimulated\":true,";
+  json += "\"scheduleEnabled\":";
+  json += (gSchedule.enabled ? "true" : "false");
+  json += ",";
+  json += "\"scheduleHour\":";
+  json += String(gSchedule.hour);
+  json += ",";
+  json += "\"scheduleMinute\":";
+  json += String(gSchedule.minute);
+  json += ",";
+  json += "\"scheduleIntervalDays\":";
+  json += String(gSchedule.intervalDays);
+  json += ",";
+  json += "\"scheduleDurationSec\":";
+  json += String(gSchedule.durationSec);
+  json += ",";
+  json += "\"scheduleSummary\":\"";
+  json += scheduleSummaryText();
+  json += "\"";
   json += "}";
+
   return json;
 }
 
+// ==============================
+// 页面
+// ==============================
 String htmlPage() {
   int soil = currentSoilMoisturePercent();
   String soilText = soilLevelText(soil);
   String stateText = pumpState ? "RUNNING" : "STOPPED";
   String badgeClass = pumpState ? "running" : "stopped";
+  String timeText = currentBeijingTimeText();
+  String ssidText = WiFi.SSID();
+  String scheduleText = scheduleSummaryText();
 
   String html = R"rawliteral(
 <!DOCTYPE html>
@@ -210,7 +393,7 @@ String htmlPage() {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MustangYM</title>
+  <title>MustangYM 浇水控制台</title>
   <style>
     :root {
       --bg1: #0f172a;
@@ -242,7 +425,7 @@ String htmlPage() {
     }
 
     .wrap {
-      max-width: 920px;
+      max-width: 980px;
       margin: 0 auto;
     }
 
@@ -364,12 +547,6 @@ String htmlPage() {
       line-height: 1;
     }
 
-    .soilHint {
-      color: var(--sub);
-      font-size: 13px;
-      line-height: 1.6;
-    }
-
     .barWrap {
       width: 100%;
       height: 16px;
@@ -469,6 +646,45 @@ String htmlPage() {
       transform: translateX(-50%) translateY(0);
     }
 
+    .formGrid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .label {
+      color: var(--sub);
+      font-size: 12px;
+    }
+
+    .input, .checkboxWrap {
+      width: 100%;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.05);
+      color: white;
+      border-radius: 12px;
+      padding: 12px;
+      font-size: 15px;
+      outline: none;
+    }
+
+    .checkboxWrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .full {
+      grid-column: 1 / -1;
+    }
+
     @media (max-width: 820px) {
       .grid {
         grid-template-columns: 1fr;
@@ -476,15 +692,18 @@ String htmlPage() {
       .title {
         font-size: 26px;
       }
+      .formGrid {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="hero">
-      <div class="title">MustangYM浇水控制台</div>
+      <div class="title">MustangYM 浇水控制台</div>
       <div class="desc">
-         LED 模拟水泵运行状态。
+        支持手动浇水、自动定时浇水、北京时间同步、Wi-Fi 信息显示。
       </div>
     </div>
 
@@ -496,6 +715,18 @@ String htmlPage() {
         </div>
 
         <div class="metrics">
+          <div class="metric">
+            <div class="metricLabel">北京时间</div>
+            <div id="timeText" class="metricValue">%TIME%</div>
+            <div id="timeSyncText" class="metricSub">时间同步状态检查中...</div>
+          </div>
+
+          <div class="metric">
+            <div class="metricLabel">当前 Wi-Fi</div>
+            <div id="ssidText" class="metricValue">%SSID%</div>
+            <div class="metricSub">当前连接的局域网</div>
+          </div>
+
           <div class="metric">
             <div class="metricLabel">剩余时间</div>
             <div id="remainingText" class="metricValue">%REMAIN%</div>
@@ -542,7 +773,43 @@ String htmlPage() {
           <div id="soilBar" class="bar" style="width:%SOIL%%;"></div>
         </div>
 
-        <div class="soilHint">
+        <div class="metric">
+          <div class="metricLabel">当前定时计划</div>
+          <div id="scheduleSummary" class="metricValue" style="font-size:18px;">%SCHEDULE_TEXT%</div>
+          <div class="metricSub">保存后立即生效</div>
+        </div>
+
+        <div class="formGrid">
+          <div class="field full">
+            <label class="checkboxWrap">
+              <input id="scheduleEnabled" type="checkbox" />
+              <span>启用自动定时浇水</span>
+            </label>
+          </div>
+
+          <div class="field">
+            <label class="label">小时（0-23）</label>
+            <input id="scheduleHour" class="input" type="number" min="0" max="23" value="9" />
+          </div>
+
+          <div class="field">
+            <label class="label">分钟（0-59）</label>
+            <input id="scheduleMinute" class="input" type="number" min="0" max="59" value="0" />
+          </div>
+
+          <div class="field">
+            <label class="label">间隔天数</label>
+            <input id="scheduleIntervalDays" class="input" type="number" min="1" max="365" value="1" />
+          </div>
+
+          <div class="field">
+            <label class="label">每次浇水秒数</label>
+            <input id="scheduleDurationSec" class="input" type="number" min="1" max="600" value="5" />
+          </div>
+
+          <div class="field full">
+            <button class="btn btn-blue" onclick="saveSchedule()">保存定时计划</button>
+          </div>
         </div>
       </div>
     </div>
@@ -555,86 +822,179 @@ String htmlPage() {
   <div id="toast" class="toast"></div>
 
   <script>
-    let actionBusy = false;
+  let actionBusy = false;
 
-    function showToast(msg) {
-      const toast = document.getElementById('toast');
-      toast.textContent = msg;
-      toast.classList.add('show');
-      clearTimeout(showToast._timer);
-      showToast._timer = setTimeout(() => {
-        toast.classList.remove('show');
-      }, 1200);
-    }
+  // 是否已经用服务端数据初始化过表单
+  let scheduleFormInitialized = false;
 
-    function setButtonsDisabled(disabled) {
-      document.querySelectorAll('.buttons .btn').forEach(btn => {
-        btn.disabled = disabled;
+  // 用户是否正在编辑定时面板
+  let scheduleFormDirty = false;
+
+  function showToast(msg) {
+    const toast = document.getElementById('toast');
+    toast.textContent = msg;
+    toast.classList.add('show');
+    clearTimeout(showToast._timer);
+    showToast._timer = setTimeout(() => {
+      toast.classList.remove('show');
+    }, 1500);
+  }
+
+  function setButtonsDisabled(disabled) {
+    document.querySelectorAll('.buttons .btn').forEach(btn => {
+      btn.disabled = disabled;
+    });
+  }
+
+  function scheduleInputs() {
+    return [
+      document.getElementById('scheduleEnabled'),
+      document.getElementById('scheduleHour'),
+      document.getElementById('scheduleMinute'),
+      document.getElementById('scheduleIntervalDays'),
+      document.getElementById('scheduleDurationSec')
+    ];
+  }
+
+  function bindScheduleEditEvents() {
+    scheduleInputs().forEach(el => {
+      el.addEventListener('input', () => {
+        scheduleFormDirty = true;
       });
+      el.addEventListener('change', () => {
+        scheduleFormDirty = true;
+      });
+    });
+  }
+
+  function fillScheduleForm(data, force = false) {
+    // 用户正在编辑时，不要自动覆盖
+    if (!force && scheduleFormInitialized && scheduleFormDirty) {
+      return;
     }
 
-    async function refreshStatus(showMsg = false) {
-      try {
-        const res = await fetch('/status?_t=' + Date.now(), {
-          method: 'GET',
-          cache: 'no-store'
-        });
-        const data = await res.json();
+    document.getElementById('scheduleEnabled').checked = !!data.scheduleEnabled;
+    document.getElementById('scheduleHour').value = data.scheduleHour;
+    document.getElementById('scheduleMinute').value = data.scheduleMinute;
+    document.getElementById('scheduleIntervalDays').value = data.scheduleIntervalDays;
+    document.getElementById('scheduleDurationSec').value = data.scheduleDurationSec;
 
-        const badge = document.getElementById('pumpBadge');
-        badge.textContent = data.pump === 'on' ? 'RUNNING' : 'STOPPED';
-        badge.className = 'badge ' + (data.pump === 'on' ? 'running' : 'stopped');
+    scheduleFormInitialized = true;
+    scheduleFormDirty = false;
+  }
 
-        document.getElementById('remainingText').textContent = data.remaining;
-        document.getElementById('countText').textContent = data.count;
-        document.getElementById('totalText').textContent = data.total;
-        document.getElementById('uptimeText').textContent = data.uptime;
-        document.getElementById('ipText').textContent = data.ip;
+  async function refreshStatus(showMsg = false) {
+    try {
+      const res = await fetch('/status?_t=' + Date.now(), {
+        method: 'GET',
+        cache: 'no-store'
+      });
+      const data = await res.json();
 
-        document.getElementById('soilValue').textContent = data.soil + '%';
-        document.getElementById('soilText').textContent = data.soilText;
-        document.getElementById('soilBar').style.width = data.soil + '%';
+      const badge = document.getElementById('pumpBadge');
+      badge.textContent = data.pump === 'on' ? 'RUNNING' : 'STOPPED';
+      badge.className = 'badge ' + (data.pump === 'on' ? 'running' : 'stopped');
 
-        if (showMsg) {
-          showToast('状态已刷新');
-        }
-      } catch (err) {
-        console.log('refresh failed', err);
+      document.getElementById('remainingText').textContent = data.remaining;
+      document.getElementById('countText').textContent = data.count;
+      document.getElementById('totalText').textContent = data.total;
+      document.getElementById('uptimeText').textContent = data.uptime;
+      document.getElementById('ipText').textContent = data.ip;
+      document.getElementById('ssidText').textContent = data.ssid || '-';
+      document.getElementById('timeText').textContent = data.beijingTime || '未同步';
+      document.getElementById('timeSyncText').textContent = data.timeSynced
+        ? 'NTP 已同步，可用于定时浇水'
+        : '时间未同步，定时浇水不可靠';
+
+      document.getElementById('soilValue').textContent = data.soil + '%';
+      document.getElementById('soilText').textContent = data.soilText;
+      document.getElementById('soilBar').style.width = data.soil + '%';
+
+      document.getElementById('scheduleSummary').textContent =
+        data.scheduleSummary || '当前未启用自动浇水';
+
+      // 只有第一次加载，或者用户没在编辑时，才同步表单
+      fillScheduleForm(data, false);
+
+      if (showMsg) {
+        showToast('状态已刷新');
       }
+    } catch (err) {
+      console.log('refresh failed', err);
     }
+  }
 
-    async function runAction(url, okMsg) {
-      if (actionBusy) return;
+  async function runAction(url, okMsg) {
+    if (actionBusy) return;
 
-      actionBusy = true;
-      setButtonsDisabled(true);
+    actionBusy = true;
+    setButtonsDisabled(true);
 
-      try {
-        await fetch(url + (url.includes('?') ? '&' : '?') + '_t=' + Date.now(), {
-          method: 'GET',
-          cache: 'no-store'
-        });
+    try {
+      await fetch(url + (url.includes('?') ? '&' : '?') + '_t=' + Date.now(), {
+        method: 'GET',
+        cache: 'no-store'
+      });
 
+      await refreshStatus(false);
+      showToast(okMsg);
+
+      setTimeout(() => refreshStatus(false), 120);
+      setTimeout(() => refreshStatus(false), 500);
+    } catch (err) {
+      console.log('action failed', err);
+      showToast('请求失败');
+    } finally {
+      setButtonsDisabled(false);
+      actionBusy = false;
+    }
+  }
+
+  async function saveSchedule() {
+    const enabled = document.getElementById('scheduleEnabled').checked ? 1 : 0;
+    const hour = parseInt(document.getElementById('scheduleHour').value || '0', 10);
+    const minute = parseInt(document.getElementById('scheduleMinute').value || '0', 10);
+    const intervalDays = parseInt(document.getElementById('scheduleIntervalDays').value || '1', 10);
+    const durationSec = parseInt(document.getElementById('scheduleDurationSec').value || '5', 10);
+
+    const url = `/schedule/set?enabled=${enabled}&hour=${hour}&minute=${minute}&intervalDays=${intervalDays}&durationSec=${durationSec}`;
+
+    try {
+      const res = await fetch(url + '&_t=' + Date.now(), {
+        method: 'GET',
+        cache: 'no-store'
+      });
+      const text = await res.text();
+
+      if (text === 'OK') {
+        scheduleFormDirty = false;
         await refreshStatus(false);
-        showToast(okMsg);
-
-        setTimeout(() => refreshStatus(false), 120);
-        setTimeout(() => refreshStatus(false), 500);
-      } catch (err) {
-        console.log('action failed', err);
-        showToast('请求失败');
-      } finally {
-        setButtonsDisabled(false);
-        actionBusy = false;
+        fillScheduleForm({
+          scheduleEnabled: !!enabled,
+          scheduleHour: hour,
+          scheduleMinute: minute,
+          scheduleIntervalDays: intervalDays,
+          scheduleDurationSec: durationSec
+        }, true);
+        showToast('定时计划已保存');
+      } else {
+        showToast('保存失败');
       }
+    } catch (err) {
+      console.log(err);
+      showToast('请求失败');
     }
+  }
 
-    setInterval(() => {
-      if (!actionBusy) {
-        refreshStatus(false);
-      }
-    }, 1000);
-  </script>
+  bindScheduleEditEvents();
+  refreshStatus(false);
+
+  setInterval(() => {
+    if (!actionBusy) {
+      refreshStatus(false);
+    }
+  }, 1000);
+</script>
 </body>
 </html>
 )rawliteral";
@@ -642,16 +1002,22 @@ String htmlPage() {
   html.replace("%STATE%", stateText);
   html.replace("%BADGE_CLASS%", badgeClass);
   html.replace("%IP%", WiFi.localIP().toString());
+  html.replace("%TIME%", timeText);
+  html.replace("%SSID%", ssidText);
   html.replace("%REMAIN%", currentRemainingText());
   html.replace("%COUNT%", String(waterCount));
   html.replace("%TOTAL%", currentTotalWaterText());
   html.replace("%UPTIME%", currentUptimeText());
   html.replace("%SOIL%", String(soil));
   html.replace("%SOIL_TEXT%", soilText);
+  html.replace("%SCHEDULE_TEXT%", scheduleText);
 
   return html;
 }
 
+// ==============================
+// 接口
+// ==============================
 void handleRoot() {
   server.send(200, "text/html; charset=utf-8", htmlPage());
 }
@@ -693,10 +1059,53 @@ void handleReset() {
   server.send(200, "text/plain; charset=utf-8", "OK");
 }
 
+void handleScheduleSet() {
+  if (!server.hasArg("enabled") ||
+      !server.hasArg("hour") ||
+      !server.hasArg("minute") ||
+      !server.hasArg("intervalDays") ||
+      !server.hasArg("durationSec")) {
+    server.send(400, "text/plain; charset=utf-8", "missing args");
+    return;
+  }
+
+  int enabled = server.arg("enabled").toInt();
+  int hour = server.arg("hour").toInt();
+  int minute = server.arg("minute").toInt();
+  int intervalDays = server.arg("intervalDays").toInt();
+  int durationSec = server.arg("durationSec").toInt();
+
+  if (hour < 0 || hour > 23 ||
+      minute < 0 || minute > 59 ||
+      intervalDays < 1 || intervalDays > 365 ||
+      durationSec < 1 || durationSec > 600) {
+    server.send(400, "text/plain; charset=utf-8", "invalid args");
+    return;
+  }
+
+  gSchedule.enabled = (enabled == 1);
+  gSchedule.hour = hour;
+  gSchedule.minute = minute;
+  gSchedule.intervalDays = intervalDays;
+  gSchedule.durationSec = durationSec;
+
+  long today = currentEpochDay();
+  gSchedule.anchorEpochDay = today;
+  gSchedule.lastRunEpochDay = -1;
+
+  Serial.println("Schedule updated:");
+  Serial.println(scheduleSummaryText());
+
+  server.send(200, "text/plain; charset=utf-8", "OK");
+}
+
 void handleStatus() {
   server.send(200, "application/json; charset=utf-8", jsonStatus());
 }
 
+// ==============================
+// 网络
+// ==============================
 void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -712,16 +1121,40 @@ void connectWiFi() {
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    WiFi.setSleep(false);   // 关掉 Wi-Fi 省电，降低延迟
+    WiFi.setSleep(false);
     Serial.println("Wi-Fi connected!");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
+    Serial.print("SSID: ");
+    Serial.println(WiFi.SSID());
   } else {
     Serial.println("Wi-Fi connect failed.");
     Serial.println("Please check SSID / password.");
   }
 }
 
+void initBeijingTime() {
+  setenv("TZ", TZ_INFO, 1);
+  tzset();
+  configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+
+  Serial.println("Syncing Beijing time...");
+  for (int i = 0; i < 20; i++) {
+    if (isTimeSynced()) {
+      Serial.print("Time synced: ");
+      Serial.println(currentBeijingTimeText());
+      return;
+    }
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.println("Time sync not ready yet, will continue in background.");
+}
+
+// ==============================
+// Arduino
+// ==============================
 void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(PUMP_PIN, OUTPUT);
@@ -739,12 +1172,14 @@ void setup() {
   Serial.println("================================");
 
   connectWiFi();
+  initBeijingTime();
 
   server.on("/", handleRoot);
   server.on("/on", handleOn);
   server.on("/off", handleOff);
   server.on("/water", handleWater);
   server.on("/reset", handleReset);
+  server.on("/schedule/set", handleScheduleSet);
   server.on("/status", handleStatus);
 
   server.begin();
@@ -756,6 +1191,7 @@ void loop() {
   server.handleClient();
 
   updateSimulatedSoilMoisture();
+  checkScheduleTask();
 
   if (pumpState && autoStopEnabled && millis() >= autoStopAt) {
     stopWatering("auto timeout");
